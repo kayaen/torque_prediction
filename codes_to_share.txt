@@ -1,0 +1,182 @@
+import numpy as np
+from sklearn.preprocessing import minmax_scale
+
+
+def rmse(actual: np.ndarray, predicted: np.ndarray):
+    """ Root Mean Squared Error """
+    return np.sqrt(np.mean(np.square(actual - predicted)))
+
+
+def nrmse(actual: np.ndarray, predicted: np.ndarray):
+    """ Normalized Root Mean Squared Error """
+    return rmse(actual, predicted) / (actual.max() - actual.min())
+
+
+def calculate_metrics(reference_data_scaled, reference_data_before_scaled, true_data, prediction_data):
+    # return rmse, nrmse, correlation coefficient, rescaled output
+    gt_max = reference_data_before_scaled.max()
+    gt_min = reference_data_before_scaled.min()
+
+    x_pred = minmax_scale(prediction_data, feature_range=(gt_min, gt_max))
+    x_true = reference_data_before_scaled
+    
+    return rmse(x_true, x_pred), nrmse(x_true, x_pred), np.corrcoef(x_true, x_pred)[0, 1], x_pred
+
+
+def resample_by_linspace(signal, output_len):
+    out_idxs = [int(i) for i in np.linspace(0, len(signal) - 1, output_len).round()]
+    signal_resampled = signal[out_idxs]
+    return signal_resampled
+
+    
+def filter_emg(emg, low_pass=10, sfreq=1000, high_band=10, low_band=450):
+    high_band = high_band / (sfreq / 2)
+    low_band = low_band / (sfreq / 2)
+
+    b1, a1 = butter(N=4, Wn=[high_band, low_band], btype='bandpass')
+
+    emg_filtered = filtfilt(b1, a1, emg)
+
+    emg_rectified = abs(emg_filtered)
+
+    low_pass = low_pass / (sfreq / 2)
+    b2, a2 = butter(N=4, Wn=low_pass, btype='lowpass')
+    emg_envelope = filtfilt(b2, a2, emg_rectified)
+
+    return emg_filtered, emg_rectified, emg_envelope
+
+
+class RNNModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
+        super(RNNModel, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.batch_size = 8
+        self.num_layers = num_layers
+
+        self.init_linear = nn.Linear(self.input_dim, self.input_dim)
+
+        self.lstm = nn.LSTM(self.input_dim, self.hidden_dim, self.num_layers, batch_first=True,
+                                                dropout=0.5, bidirectional=True)
+
+        self.linear = nn.Linear(self.hidden_dim * 2, output_dim)
+
+    def init_hidden(self):
+        # initialise our hidden state as
+        return (torch.zeros(self.num_layers, self.batch_size, self.hidden_dim),
+                torch.zeros(self.num_layers, self.batch_size, self.hidden_dim))
+
+    def forward(self, input):
+        # Forward pass 
+        linear_input = self.init_linear(input)
+
+        lstm_out, self.hidden = self.lstm(linear_input)
+
+        y_pred = self.linear(lstm_out)
+        return y_pred
+
+
+# Train and evaluate the accuarcy of neural network model
+def train_and_evaluate(param, model, train_loader, valid_loader):
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=param['learning_rate'], weight_decay=param['weight_decay'])
+
+    # Run the training loop
+    loss_list = []
+    for epoch in range(0, param['num_epoch']): # 300
+        train_loss = 0.0
+        model.train()
+        for data, labels in train_loader:
+            data, labels = data.float(), labels.float()
+
+            # Transfer Data to GPU if available
+            if torch.cuda.is_available():
+                data, labels = data.cuda(), labels.cuda()
+
+            optimizer.zero_grad()
+            outputs = model(data)
+            loss = criterion(outputs,labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+
+        if valid_loader is not None:
+            valid_loss = 0.0
+            model.eval()	 # Optional when not using Model Specific layer
+            for data, labels in valid_loader:
+                data, labels = data.float(), labels.float()
+
+                # Transfer Data to GPU if available
+                if torch.cuda.is_available():
+                    data, labels = data.cuda(), labels.cuda()
+
+                with torch.no_grad():
+                    outputs = model(data)
+                loss = criterion(outputs,labels)
+                valid_loss += loss.item()
+
+            total_loss = valid_loss/len(valid_loader)
+        else:
+            total_loss = 0
+
+        loss_list.append([train_loss/len(train_loader), total_loss])
+
+    return model, total_loss, loss_list
+
+
+def objective_both(trial):
+    in_cols = emg_cols_preprocessed + kinematic_cols_preprocessed
+    out_cols = kinetic_cols_preprocessed
+
+    params = {
+        'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
+        'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True),
+        'hidden_dim': trial.suggest_int("hidden_dim", 10, 100),
+        'layer_dim': trial.suggest_int("layer_dim", 1, 4),
+        'num_epoch': 200
+    }
+
+    input_dim = len(in_cols)    # input dimension
+    output_dim = len(out_cols)   # output dimension
+    hidden_dim = params['hidden_dim']
+    layer_dim = params['layer_dim']
+
+    # Configuration options
+    k_folds = 4
+    # Define the K-fold Cross Validator
+    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+    subjects = data_selected.SubjID.unique()
+
+    total_loss_all_folds = 0
+
+    # K-fold Cross Validation model evaluation
+    for fold, (train_subjs, test_subjs) in enumerate(kfold.split(subjects)):
+        # Print
+        print('--------------------------------')
+        print(f'FOLD {fold}  Test Subjects: {subjects[test_subjs]}')
+
+        train_idxs = data_selected[data_selected.SubjID.isin(subjects[train_subjs])].index
+        test_idxs = data_selected[data_selected.SubjID.isin(subjects[test_subjs])].index
+
+        train_df = data_selected.loc[train_idxs]
+        test_df = data_selected.loc[test_idxs]
+
+        ds_train = PrepareData(train_df, in_cols, out_cols)
+        train_loader = DataLoader(ds_train, batch_size=8, shuffle=True, drop_last=True)
+
+        ds_valid = PrepareData(test_df, in_cols, out_cols)
+        valid_loader = DataLoader(ds_valid, batch_size=8, shuffle=True, drop_last=True)
+
+        model = RNNModel(input_dim, hidden_dim, layer_dim, output_dim)
+        if torch.cuda.is_available():
+            model = model.cuda()
+
+        _, total_loss, _ = train_and_evaluate(params, model, train_loader, valid_loader)
+
+        total_loss_all_folds = total_loss_all_folds + total_loss
+
+    return total_loss_all_folds
+study_both = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler())
+study_both.optimize(objective_both, n_trials=20)
